@@ -1,6 +1,6 @@
 {
   "build": {
-    "builder": "NIXPACKS",
+    "builder": "Railpack",
     "buildCommand": "cd backend && pip install -r requirements.txt"
   },
   "deploy": {
