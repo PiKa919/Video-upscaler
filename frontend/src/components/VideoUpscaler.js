@@ -117,9 +117,28 @@ export default function VideoUpscaler() {
   };
 
   // Download processed video
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (videoInfo && status === "completed") {
-      window.open(`${API}/download/${videoInfo.id}`, "_blank");
+      try {
+        // Fetch the video file
+        const response = await axios.get(`${API}/download/${videoInfo.id}`, {
+          responseType: 'blob'
+        });
+        
+        // Create a blob URL and trigger download
+        const blob = new Blob([response.data], { type: 'video/mp4' });
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${videoInfo.filename.replace(/\.[^/.]+$/, '')}_1080p.mp4`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      } catch (err) {
+        console.error("Download error:", err);
+        setError("Failed to download video");
+      }
     }
   };
 
