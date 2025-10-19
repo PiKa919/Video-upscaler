@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -11,11 +11,16 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
 import ffmpeg
+# Set FFmpeg path for Windows
+ffmpeg_path = Path(__file__).parent / "ffmpeg" / "ffmpeg-8.0-essentials_build" / "bin"
+if ffmpeg_path.exists():
+    os.environ['PATH'] = str(ffmpeg_path) + os.pathsep + os.environ.get('PATH', '')
 import aiofiles
 import asyncio
 from PIL import Image
 import json
 import shutil
+from storage import storage
 
 
 ROOT_DIR = Path(__file__).parent
@@ -25,12 +30,6 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
-
-# Create directories for video storage
-UPLOAD_DIR = ROOT_DIR / "uploads"
-PROCESSED_DIR = ROOT_DIR / "processed"
-UPLOAD_DIR.mkdir(exist_ok=True)
-PROCESSED_DIR.mkdir(exist_ok=True)
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -63,6 +62,7 @@ class VideoInfoResponse(BaseModel):
     error_message: Optional[str] = None
     upload_time: datetime
     processed_time: Optional[datetime] = None
+    processed_path: Optional[str] = None
 
 
 # Helper function to get video metadata
@@ -84,54 +84,102 @@ def get_video_info(video_path: str) -> dict:
 
 
 # Helper function to upscale video
-async def upscale_video(input_path: str, output_path: str, video_id: str) -> bool:
+async def upscale_video(input_path: str, video_id: str) -> bool:
     try:
-        # Get input video info
-        video_info = get_video_info(input_path)
-        
-        # Check if video has audio stream
-        probe = ffmpeg.probe(input_path)
-        has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
-        
-        # Use bicubic scaling algorithm for upscaling
-        stream = ffmpeg.input(input_path)
-        
-        # Scale video to 1920x1080 using bicubic algorithm
-        video = stream.video.filter('scale', 1920, 1080, flags='bicubic')
-        
-        # Build output arguments
-        output_args = [video, output_path]
-        output_kwargs = {
-            'vcodec': 'libx264',  # Use H.264 codec
-            'preset': 'medium',   # Balance between speed and quality
-            'crf': 18            # High quality setting
-        }
-        
-        # Add audio handling if audio stream exists
-        if has_audio:
-            audio = stream.audio
-            output_args.insert(1, audio)  # Insert audio after video
-            output_kwargs['acodec'] = 'copy'  # Copy audio without re-encoding
-        
-        # Create output
-        output = ffmpeg.output(*output_args, **output_kwargs)
-        
-        # Run FFmpeg
-        await asyncio.to_thread(output.overwrite_output().run)
-        
-        # Update database
-        await db.videos.update_one(
-            {"id": video_id},
-            {
-                "$set": {
-                    "status": "completed",
-                    "processed_time": datetime.now(timezone.utc).isoformat(),
-                    "processed_path": output_path
+        import tempfile
+        import requests
+        import os
+
+        # Check if input_path is a URL (cloud storage) or local path
+        if input_path.startswith(('http://', 'https://')):
+            # Download input file to temporary location for cloud storage
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_input:
+                temp_input_path = temp_input.name
+
+            try:
+                # Download the file
+                response = requests.get(input_path, stream=True)
+                response.raise_for_status()
+
+                with open(temp_input_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            except Exception as e:
+                logging.error(f"Failed to download file from {input_path}: {e}")
+                raise
+        else:
+            # Local file path - use directly
+            temp_input_path = input_path
+
+        try:
+
+            # Get input video info
+            video_info = get_video_info(temp_input_path)
+
+            # Check if video has audio stream
+            probe = ffmpeg.probe(temp_input_path)
+            has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+
+            # Create temporary output file
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
+                temp_output_path = temp_output.name
+
+            try:
+                # Use bicubic scaling algorithm for upscaling
+                stream = ffmpeg.input(temp_input_path)
+
+                # Scale video to 1920x1080 using bicubic algorithm
+                video = stream.video.filter('scale', 1920, 1080, flags='bicubic')
+
+                # Build output arguments
+                output_args = [video, temp_output_path]
+                output_kwargs = {
+                    'vcodec': 'libx264',  # Use H.264 codec
+                    'preset': 'medium',   # Balance between speed and quality
+                    'crf': 18            # High quality setting
                 }
-            }
-        )
-        
-        return True
+
+                # Add audio handling if audio stream exists
+                if has_audio:
+                    audio = stream.audio
+                    output_args.insert(1, audio)  # Insert audio after video
+                    output_kwargs['acodec'] = 'copy'  # Copy audio without re-encoding
+
+                # Create output
+                output = ffmpeg.output(*output_args, **output_kwargs)
+
+                # Run FFmpeg
+                await asyncio.to_thread(output.overwrite_output().run)
+
+                # Upload processed file to cloud storage
+                output_filename = storage.generate_filename("processed.mp4", "1080p")
+                with open(temp_output_path, 'rb') as f:
+                    processed_url = await storage.upload_file(f, output_filename, "processed")
+
+                # Update database
+                await db.videos.update_one(
+                    {"id": video_id},
+                    {
+                        "$set": {
+                            "status": "completed",
+                            "processed_time": datetime.now(timezone.utc).isoformat(),
+                            "processed_path": processed_url,
+                            "original_resolution": f"{video_info.get('width', 0)}x{video_info.get('height', 0)}"
+                        }
+                    }
+                )
+
+                return True
+
+            finally:
+                # Clean up temp output file
+                Path(temp_output_path).unlink(missing_ok=True)
+
+        finally:
+            # Clean up temp input file (only if we downloaded it, not for local files)
+            if input_path.startswith(('http://', 'https://')):
+                Path(temp_input_path).unlink(missing_ok=True)
+
     except Exception as e:
         logging.error(f"Error upscaling video: {e}")
         # Update database with error
@@ -159,35 +207,43 @@ async def upload_video(file: UploadFile = File(...)):
     try:
         # Generate unique ID
         video_id = str(uuid.uuid4())
-        file_extension = Path(file.filename).suffix
-        
-        # Save uploaded file
-        upload_path = UPLOAD_DIR / f"{video_id}{file_extension}"
-        
-        async with aiofiles.open(upload_path, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
-        
-        # Get video information
-        video_info = get_video_info(str(upload_path))
+        filename = storage.generate_filename(file.filename)
+
+        # Read file content
+        content = await file.read()
+
+        # Upload to cloud storage
+        from io import BytesIO
+        file_obj = BytesIO(content)
+        upload_url = await storage.upload_file(file_obj, filename, "uploads")
+
+        # For local storage, we need to download the file temporarily to get video info
+        if storage.storage_type == 'local':
+            # File is already local, use the path
+            video_info = get_video_info(upload_url)
+        else:
+            # For cloud storage, we need to download temporarily or use alternative method
+            # For now, we'll store the URL and get info after processing
+            video_info = None
+
         resolution = f"{video_info.get('width', 0)}x{video_info.get('height', 0)}" if video_info else None
-        
+
         # Create video record
         video_record = VideoInfo(
             id=video_id,
             filename=file.filename,
             original_resolution=resolution,
-            original_path=str(upload_path),
+            original_path=upload_url,
             status="uploaded"
         )
-        
+
         # Save to database
         doc = video_record.model_dump()
         doc['upload_time'] = doc['upload_time'].isoformat()
         await db.videos.insert_one(doc)
-        
+
         return VideoInfoResponse(**video_record.model_dump())
-        
+
     except Exception as e:
         logging.error(f"Error uploading video: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -199,29 +255,27 @@ async def process_video(video_id: str):
     try:
         # Get video from database
         video = await db.videos.find_one({"id": video_id}, {"_id": 0})
-        
+
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
-        
+
         if video['status'] != 'uploaded':
             raise HTTPException(status_code=400, detail="Video already processed or processing")
-        
+
         # Update status to processing
         await db.videos.update_one(
             {"id": video_id},
             {"$set": {"status": "processing"}}
         )
-        
-        # Get paths
-        input_path = video['original_path']
-        file_extension = Path(input_path).suffix
-        output_path = str(PROCESSED_DIR / f"{video_id}_1080p{file_extension}")
-        
+
+        # Get input URL
+        input_url = video['original_path']
+
         # Start upscaling in background
-        asyncio.create_task(upscale_video(input_path, output_path, video_id))
-        
+        asyncio.create_task(upscale_video(input_url, video_id))
+
         return {"message": "Processing started", "video_id": video_id}
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -258,28 +312,36 @@ async def download_video(video_id: str):
     """Download the processed video"""
     try:
         video = await db.videos.find_one({"id": video_id}, {"_id": 0})
-        
+
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
-        
+
         if video['status'] != 'completed':
             raise HTTPException(status_code=400, detail="Video not ready for download")
-        
-        processed_path = video.get('processed_path')
-        if not processed_path or not Path(processed_path).exists():
+
+        processed_url = video.get('processed_path')
+        if not processed_url:
             raise HTTPException(status_code=404, detail="Processed file not found")
-        
-        # Create download filename
-        original_name = Path(video['filename']).stem
-        extension = Path(processed_path).suffix
-        download_name = f"{original_name}_1080p{extension}"
-        
-        return FileResponse(
-            processed_path,
-            media_type="video/mp4",
-            filename=download_name
-        )
-        
+
+        # For local storage, serve the file directly
+        if storage.storage_type == 'local':
+            if not Path(processed_url).exists():
+                raise HTTPException(status_code=404, detail="Processed file not found")
+
+            # Create download filename
+            original_name = Path(video['filename']).stem
+            extension = Path(processed_url).suffix
+            download_name = f"{original_name}_1080p{extension}"
+
+            return FileResponse(
+                processed_url,
+                media_type="video/mp4",
+                filename=download_name
+            )
+        else:
+            # For cloud storage, redirect to the URL
+            return RedirectResponse(url=processed_url)
+
     except HTTPException:
         raise
     except Exception as e:
