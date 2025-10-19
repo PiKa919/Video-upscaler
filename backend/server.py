@@ -369,6 +369,13 @@ async def list_videos():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Health check endpoint
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for Railway"""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
 # Include the router in the main app
 app.include_router(api_router)
 
