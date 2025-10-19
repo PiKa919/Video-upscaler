@@ -89,26 +89,32 @@ async def upscale_video(input_path: str, output_path: str, video_id: str) -> boo
         # Get input video info
         video_info = get_video_info(input_path)
         
+        # Check if video has audio stream
+        probe = ffmpeg.probe(input_path)
+        has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+        
         # Use bicubic scaling algorithm for upscaling
-        # Preserve codec, audio, and other metadata
         stream = ffmpeg.input(input_path)
         
         # Scale video to 1920x1080 using bicubic algorithm
         video = stream.video.filter('scale', 1920, 1080, flags='bicubic')
         
-        # Copy audio without re-encoding
-        audio = stream.audio
+        # Build output arguments
+        output_args = [video, output_path]
+        output_kwargs = {
+            'vcodec': 'libx264',  # Use H.264 codec
+            'preset': 'medium',   # Balance between speed and quality
+            'crf': 18            # High quality setting
+        }
         
-        # Output with same codec and settings
-        output = ffmpeg.output(
-            video, 
-            audio, 
-            output_path,
-            vcodec='libx264',  # Use H.264 codec
-            acodec='copy',  # Copy audio without re-encoding
-            preset='medium',  # Balance between speed and quality
-            crf=18  # High quality setting
-        )
+        # Add audio handling if audio stream exists
+        if has_audio:
+            audio = stream.audio
+            output_args.insert(1, audio)  # Insert audio after video
+            output_kwargs['acodec'] = 'copy'  # Copy audio without re-encoding
+        
+        # Create output
+        output = ffmpeg.output(*output_args, **output_kwargs)
         
         # Run FFmpeg
         await asyncio.to_thread(output.overwrite_output().run)
