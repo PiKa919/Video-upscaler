@@ -14,7 +14,7 @@ import sys
 
 # Configuration
 BASE_URL = "https://video-enhancer-17.preview.emergentagent.com/api"
-TEST_VIDEO_PATH = "/app/test_720p.mp4"
+TEST_VIDEO_PATH = "/app/test_720p_with_audio.mp4"
 TIMEOUT = 300  # 5 minutes timeout for processing
 
 class VideoUpscalerTester:
